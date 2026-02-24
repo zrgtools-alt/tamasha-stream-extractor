@@ -1,11 +1,11 @@
 """
-Tamasha Free Channel HLS Stream Extractor API — v2.0 (Production Hardened)
-==========================================================================
-Flask + Playwright (sync API) service that extracts fresh signed HLS/m3u8
-stream URLs from Tamashaweb.com for FREE (no-login) channels only.
+Tamasha Free Channel HLS Stream Extractor API — v2.1 (Production)
+=================================================================
+Flask + Playwright headless Chromium API that extracts fresh signed
+HLS/m3u8 stream URLs from Tamashaweb.com for FREE channels only.
 
-Optimized for Render.com Docker deployment with limited RAM (512MB-1GB).
-For personal/educational testing only.
+Optimized for Render.com Docker deployment (512MB–2GB RAM).
+For personal/educational use only — no piracy, no DRM bypass.
 """
 
 import os
@@ -17,13 +17,13 @@ import logging
 import hashlib
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-from threading import Lock, Event
+from threading import Lock
 from flask import Flask, jsonify, request
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 # ==========================================================================
-# App Configuration
+# Flask App
 # ==========================================================================
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
@@ -31,162 +31,152 @@ app.config["JSON_SORT_KEYS"] = False
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
     stream=sys.stdout,
 )
 logger = logging.getLogger("tamasha")
 
 # ==========================================================================
-# Configurable parameters via environment
+# Configuration via environment
 # ==========================================================================
-EXTRA_WAIT_SECONDS = int(os.environ.get("EXTRA_WAIT_SECONDS", "10"))
-NAV_TIMEOUT_MS = int(os.environ.get("NAV_TIMEOUT_MS", "45000"))
-CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "300"))
-MAX_EXTRACTION_RETRIES = int(os.environ.get("MAX_EXTRACTION_RETRIES", "1"))
+EXTRA_WAIT = int(os.environ.get("EXTRA_WAIT_SECONDS", "12"))
+NAV_TIMEOUT = int(os.environ.get("NAV_TIMEOUT_MS", "45000"))
+CACHE_TTL = int(os.environ.get("CACHE_TTL_SECONDS", "300"))
 
-# Base URL for Tamasha — allows override if domain changes
-TAMASHA_BASE_URL = os.environ.get("TAMASHA_BASE_URL", "https://tamashaweb.com")
+# Tamasha base — they sometimes switch between tamashaweb.com and tamasha.com
+TAMASHA_BASE = os.environ.get("TAMASHA_BASE_URL", "https://tamashaweb.com")
 
 # ==========================================================================
-# Channel Slug Registry — ONLY confirmed free/no-login channels
+# FREE Channel Registry
+# Only channels confirmed playable WITHOUT login/OTP/subscription.
+# Format: "our-slug" -> "tamasha-url-slug"
+# Some channels may have alternate URL patterns — we handle that below.
 # ==========================================================================
 CHANNEL_SLUGS = {
-    # ---- Pakistani News Channels (generally all free on Tamasha) ----
-    "ary-news": "ary-news",
-    "geo-news-live": "geo-news-live",
-    "express-news-live": "express-news-live",
-    "dunya-news-live": "dunya-news-live",
-    "samaa-news-live": "samaa-news-live",
-    "92-news-live": "92-news-live",
-    "24-news-hd-live": "24-news-hd-live",
-    "hum-news-live": "hum-news-live",
-    "aaj-news-live": "aaj-news-live",
-    "bol-news-live": "bol-news-live",
-    "neo-news-live": "neo-news-live",
-    "public-news-live": "public-news-live",
-    "gnn-news-live": "gnn-news-live",
-    "capital-news-live": "capital-news-live",
-    "ab-tak-news-live": "ab-tak-news-live",
-    "city-42-live": "city-42-live",
-    "dawn-news-live": "dawn-news-live",
-    "din-news-live": "din-news-live",
-    "such-news-live": "such-news-live",
-    "k-21-news-live": "k-21-news-live",
-    "roze-news-live": "roze-news-live",
-    "sun-news-hd": "sun-news-hd",
-    "metro-one-news": "metro-one-news",
-    "pashto-1-news": "pashto-1-news",
+    # ─── News ───
+    "ary-news":             "ary-news",
+    "geo-news-live":        "geo-news-live",
+    "express-news-live":    "express-news-live",
+    "dunya-news-live":      "dunya-news-live",
+    "samaa-news-live":      "samaa-news-live",
+    "92-news-live":         "92-news-live",
+    "24-news-hd-live":      "24-news-hd-live",
+    "hum-news-live":        "hum-news-live",
+    "aaj-news-live":        "aaj-news-live",
+    "bol-news-live":        "bol-news-live",
+    "neo-news-live":        "neo-news-live",
+    "public-news-live":     "public-news-live",
+    "gnn-news-live":        "gnn-news-live",
+    "capital-news-live":    "capital-news-live",
+    "ab-tak-news-live":     "ab-tak-news-live",
+    "city-42-live":         "city-42-live",
+    "dawn-news-live":       "dawn-news-live",
+    "din-news-live":        "din-news-live",
+    "such-news-live":       "such-news-live",
+    "k-21-news-live":       "k-21-news-live",
+    "roze-news-live":       "roze-news-live",
+    "sun-news-hd":          "sun-news-hd",
+    "metro-one-news":       "metro-one-news",
 
-    # ---- Entertainment (free tier) ----
-    "green-entertainment": "green-entertainment",
-    "geo-entertainment-live": "geo-entertainment-live",
-    "ary-digital-live": "ary-digital-live",
-    "hum-tv-live": "hum-tv-live",
-    "express-entertainment-live": "express-entertainment-live",
-    "a-plus-live": "a-plus-live",
-    "tv-one-live": "tv-one-live",
-    "urdu-1-live": "urdu-1-live",
-    "see-tv-live": "see-tv-live",
-    "play-tv-live": "play-tv-live",
-    "geo-kahani-live": "geo-kahani-live",
-    "ary-zindagi-live": "ary-zindagi-live",
+    # ─── Entertainment ───
+    "green-entertainment":          "green-entertainment",
+    "geo-entertainment-live":       "geo-entertainment-live",
+    "ary-digital-live":             "ary-digital-live",
+    "hum-tv-live":                  "hum-tv-live",
+    "express-entertainment-live":   "express-entertainment-live",
+    "a-plus-live":                  "a-plus-live",
+    "tv-one-live":                  "tv-one-live",
+    "urdu-1-live":                  "urdu-1-live",
+    "see-tv-live":                  "see-tv-live",
+    "play-tv-live":                 "play-tv-live",
+    "geo-kahani-live":              "geo-kahani-live",
+    "ary-zindagi-live":             "ary-zindagi-live",
 
-    # ---- Tamasha Originals / Misc ----
+    # ─── Tamasha Original ───
     "tamasha-life-hd": "tamasha-life-hd",
 
-    # ---- Regional ----
-    "khyber-news-live": "khyber-news-live",
-    "avt-khyber-live": "avt-khyber-live",
-    "sindh-tv-news-live": "sindh-tv-news-live",
-    "ktn-news-live": "ktn-news-live",
-    "waseb-tv-live": "waseb-tv-live",
-    "mehran-tv-live": "mehran-tv-live",
+    # ─── Regional ───
+    "khyber-news-live":     "khyber-news-live",
+    "avt-khyber-live":      "avt-khyber-live",
+    "sindh-tv-news-live":   "sindh-tv-news-live",
+    "ktn-news-live":        "ktn-news-live",
+    "waseb-tv-live":        "waseb-tv-live",
+    "mehran-tv-live":       "mehran-tv-live",
 
-    # ---- Religious ----
-    "madani-channel-live": "madani-channel-live",
-    "qtv-live": "qtv-live",
-    "paigham-tv-live": "paigham-tv-live",
-    "ary-qtv-live": "ary-qtv-live",
+    # ─── Religious ───
+    "madani-channel-live":  "madani-channel-live",
+    "qtv-live":             "qtv-live",
+    "paigham-tv-live":      "paigham-tv-live",
+    "ary-qtv-live":         "ary-qtv-live",
 
-    # ---- Music / Lifestyle ----
+    # ─── Music / Lifestyle ───
     "ary-musik-live": "ary-musik-live",
 }
 
 # ==========================================================================
-# User Agent Rotation — helps avoid fingerprinting
+# URL pattern variants — Tamasha sometimes uses different URL structures
+# We try multiple patterns if the primary one fails.
 # ==========================================================================
-USER_AGENTS = [
-    (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/123.0.0.0 Safari/537.36"
-    ),
-    (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    (
-        "Mozilla/5.0 (X11; Linux x86_64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
+URL_PATTERNS = [
+    "{base}/{slug}",           # Primary: tamashaweb.com/ary-news
+    "{base}/watch/{slug}",     # Alt: tamashaweb.com/watch/ary-news
+    "{base}/live/{slug}",      # Alt: tamashaweb.com/live/ary-news
+    "{base}/live-tv/{slug}",   # Alt: tamashaweb.com/live-tv/ary-news
+    "{base}/channel/{slug}",   # Alt: tamashaweb.com/channel/ary-news
 ]
-_ua_index = 0
+
+# ==========================================================================
+# User-Agent pool
+# ==========================================================================
+_UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+]
+_ua_idx = 0
 
 
-def _next_user_agent() -> str:
-    global _ua_index
-    ua = USER_AGENTS[_ua_index % len(USER_AGENTS)]
-    _ua_index += 1
+def _get_ua():
+    global _ua_idx
+    ua = _UA_POOL[_ua_idx % len(_UA_POOL)]
+    _ua_idx += 1
     return ua
 
 
 # ==========================================================================
-# Simple in-memory cache with TTL
+# In-memory cache
 # ==========================================================================
 _cache = {}
 _cache_lock = Lock()
 
 
-def _cache_key(channel: str) -> str:
-    return channel.lower().strip()
-
-
-def _get_cached(channel: str):
-    key = _cache_key(channel)
+def cache_get(channel):
     with _cache_lock:
-        entry = _cache.get(key)
+        entry = _cache.get(channel)
         if not entry:
             return None
-        age = (datetime.utcnow() - entry["timestamp"]).total_seconds()
-        if age < CACHE_TTL_SECONDS:
-            logger.info(f"Cache HIT for '{channel}' (age: {int(age)}s)")
+        age = (datetime.utcnow() - entry["ts"]).total_seconds()
+        if age < CACHE_TTL:
+            logger.info(f"Cache HIT: '{channel}' (age {int(age)}s)")
             return entry
-        else:
-            del _cache[key]
-            return None
+        del _cache[channel]
+        return None
 
 
-def _set_cached(channel: str, url: str, all_urls: list = None):
-    key = _cache_key(channel)
+def cache_set(channel, url, all_urls=None):
     with _cache_lock:
-        _cache[key] = {
+        _cache[channel] = {
             "url": url,
             "all_urls": all_urls or [],
-            "timestamp": datetime.utcnow(),
+            "ts": datetime.utcnow(),
         }
 
 
-def _clear_cache(channel: str = None):
+def cache_clear(channel=None):
     with _cache_lock:
         if channel:
-            _cache.pop(_cache_key(channel), None)
+            _cache.pop(channel, None)
         else:
             _cache.clear()
 
@@ -194,189 +184,164 @@ def _clear_cache(channel: str = None):
 # ==========================================================================
 # Premium / Login Detection
 # ==========================================================================
-PREMIUM_URL_INDICATORS = [
+PREMIUM_URL_KEYWORDS = [
     "/plans", "/login", "/subscribe", "/signup", "/otp",
-    "/get-pro", "/upgrade", "/signin", "/auth",
+    "/get-pro", "/upgrade", "/signin", "/auth", "/verify",
 ]
 
-PREMIUM_TEXT_PATTERNS = [
-    "please login to continue",
-    "please sign in",
-    "subscribe to watch",
-    "get tamasha pro",
-    "login to watch",
-    "sign in to continue",
-    "this content is for pro",
-    "premium content",
-    "enter your otp",
-    "enter your phone",
-    "enter mobile number",
-    "subscription required",
-    "upgrade your plan",
-    "start your free trial",
-    "jazz/warid number",
+PREMIUM_TEXT_KEYWORDS = [
+    "please login", "please sign in", "subscribe to watch",
+    "get tamasha pro", "login to watch", "sign in to continue",
+    "premium content", "enter your otp", "enter your phone",
+    "enter mobile number", "subscription required",
+    "upgrade your plan", "start your free trial",
+    "jazz/warid number", "verify your number",
+    "login or signup", "create account to watch",
 ]
 
 
-def _detect_premium(page_url: str, page_content: str = "") -> dict:
-    """
-    Detect if the page is a premium/login wall.
-    Returns {"is_premium": bool, "reason": str or None}
-    """
-    url_lower = page_url.lower()
-    for indicator in PREMIUM_URL_INDICATORS:
-        if indicator in url_lower:
-            return {"is_premium": True, "reason": f"URL contains '{indicator}'"}
+def detect_premium(url, text=""):
+    url_l = url.lower()
+    for kw in PREMIUM_URL_KEYWORDS:
+        if kw in url_l:
+            return True, f"URL redirect to '{kw}'"
 
-    if page_content:
-        content_lower = page_content.lower()
-        for pattern in PREMIUM_TEXT_PATTERNS:
-            if pattern in content_lower:
-                return {"is_premium": True, "reason": f"Page contains '{pattern}'"}
+    text_l = text.lower() if text else ""
+    for kw in PREMIUM_TEXT_KEYWORDS:
+        if kw in text_l:
+            return True, f"Page shows '{kw}'"
 
-    return {"is_premium": False, "reason": None}
+    return False, None
 
 
 # ==========================================================================
-# M3U8 URL Scoring
+# M3U8 URL Scoring — pick the best captured URL
 # ==========================================================================
-def _score_m3u8_url(url: str) -> int:
-    """
-    Score an m3u8 URL by usefulness. Higher = better.
-    Prioritizes signed playlist URLs over unsigned master manifests.
-    """
-    score = 0
-    url_lower = url.lower()
+def score_url(url):
+    s = 0
+    ul = url.lower()
 
-    # Type scoring
-    if "playlist.m3u8" in url_lower:
-        score += 100
-    elif "chunklist" in url_lower:
-        score += 95
-    elif "index.m3u8" in url_lower:
-        score += 80
-    elif "mono.m3u8" in url_lower:
-        score += 75
-    elif "master.m3u8" in url_lower:
-        score += 50
-    elif ".m3u8" in url_lower:
-        score += 40
+    # Playlist type bonus
+    if "playlist.m3u8" in ul:
+        s += 100
+    elif "chunklist" in ul:
+        s += 95
+    elif "index.m3u8" in ul:
+        s += 80
+    elif "mono.m3u8" in ul:
+        s += 75
+    elif "master.m3u8" in ul:
+        s += 50
+    elif ".m3u8" in ul:
+        s += 40
 
-    # Auth token presence — critical
-    if "wmsauthsign" in url_lower:
-        score += 200
-    if "hdnts=" in url_lower or "hdntl=" in url_lower:
-        score += 150
-    if "token=" in url_lower:
-        score += 100
-    if "auth" in url_lower:
-        score += 50
+    # Auth token — most important signal
+    if "wmsauthsign" in ul:
+        s += 200
+    elif "hdnts=" in ul or "hdntl=" in ul:
+        s += 150
+    elif "token=" in ul:
+        s += 100
+    elif "auth" in ul:
+        s += 50
 
-    # Session tracking
-    if "nimblesessionid" in url_lower:
-        score += 30
+    if "nimblesessionid" in ul:
+        s += 30
+    if ul.startswith("https://"):
+        s += 10
 
-    # Prefer HTTPS
-    if url_lower.startswith("https://"):
-        score += 10
+    # Penalize ad URLs
+    for ad in ["ad.", "ads.", "adserver", "doubleclick", "googlesyndication"]:
+        if ad in ul:
+            s -= 500
 
-    # Penalize ad/tracking URLs
-    ad_indicators = ["ad.", "ads.", "adserver", "doubleclick", "googlesyndication", "analytics"]
-    for ad in ad_indicators:
-        if ad in url_lower:
-            score -= 500
-
-    # Query parameter richness
+    # Query richness
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
-    score += len(params) * 8
+    s += len(params) * 8
 
-    return score
+    return s
 
 
 # ==========================================================================
-# Core Extraction Engine
+# HLS Marker Detection — what URLs to capture
+# ==========================================================================
+HLS_MARKERS = [
+    ".m3u8", "wmsauthsign", "jazzauth", "playlist.m3u8",
+    "master.m3u8", "chunklist", "index.m3u8", "manifest.m3u8",
+]
+
+
+def is_hls_url(url):
+    ul = url.lower()
+    return any(m in ul for m in HLS_MARKERS)
+
+
+# ==========================================================================
+# Core Extraction — Playwright Headless Browser
 # ==========================================================================
 _browser_lock = Lock()
-_extraction_in_progress = {}  # channel -> Event, prevents duplicate extractions
 
 
-def _extract_stream_url(channel_slug: str, attempt: int = 1) -> dict:
+def extract_stream(channel_slug, attempt=1, max_attempts=2):
     """
-    Launch headless Chromium, navigate to channel page, intercept HLS URLs.
-    Returns a result dict with success/failure info.
+    Launch headless Chromium, navigate to channel page,
+    intercept network responses to capture signed m3u8 URL.
     """
-    page_url = f"{TAMASHA_BASE_URL}/{channel_slug}"
-    logger.info(f"[Attempt {attempt}] Extracting stream for '{channel_slug}' from {page_url}")
 
-    captured_urls = []
+    # Build URL candidates (try multiple patterns)
+    url_candidates = []
+    for pattern in URL_PATTERNS:
+        url_candidates.append(pattern.format(base=TAMASHA_BASE, slug=channel_slug))
+
+    logger.info(f"[Attempt {attempt}/{max_attempts}] Channel: '{channel_slug}'")
+    logger.info(f"  URL candidates: {url_candidates[:3]}")
+
+    captured = []
     captured_lock = Lock()
-    errors_seen = []
+    failed_m3u8 = []
+    page_urls_visited = []
 
     def on_response(response):
-        """Network response interceptor — captures HLS manifest URLs."""
         try:
-            resp_url = response.url
-            resp_lower = resp_url.lower()
-
-            # Quick filter: only care about potential HLS URLs
-            is_hls = any(marker in resp_lower for marker in [
-                ".m3u8", "wmsauthsign", "jazzauth", "playlist",
-                "master.m3u8", "chunklist", "index.m3u8", "manifest",
-            ])
-
-            if not is_hls:
+            rurl = response.url
+            if not is_hls_url(rurl):
                 return
-
             status = response.status
-            content_type = ""
-            try:
-                headers = response.headers
-                content_type = headers.get("content-type", "")
-            except Exception:
-                pass
-
-            entry = {
-                "url": resp_url,
-                "status": status,
-                "content_type": content_type,
-                "timestamp": time.time(),
-            }
-
             if 200 <= status < 400:
                 with captured_lock:
-                    captured_urls.append(entry)
-                logger.debug(f"  ✓ Captured [{status}]: {resp_url[:150]}")
-            elif status >= 400:
-                logger.debug(f"  ✗ Failed [{status}]: {resp_url[:150]}")
-
-        except Exception as e:
-            logger.debug(f"  Response callback error: {e}")
-
-    def on_request_failed(request_obj):
-        """Track failed requests for diagnostics."""
-        try:
-            url = request_obj.url
-            if ".m3u8" in url.lower():
-                failure = request_obj.failure
-                errors_seen.append({"url": url[:150], "failure": failure})
-                logger.debug(f"  ✗ Request failed: {url[:100]} — {failure}")
+                    captured.append({
+                        "url": rurl,
+                        "status": status,
+                        "time": time.time(),
+                    })
+                logger.debug(f"  ✓ [{status}] {rurl[:160]}")
+            else:
+                logger.debug(f"  ✗ [{status}] {rurl[:120]}")
         except Exception:
             pass
 
+    def on_request_failed(req):
+        try:
+            if ".m3u8" in req.url.lower():
+                failed_m3u8.append({"url": req.url[:150], "error": req.failure})
+        except Exception:
+            pass
+
+    # Acquire browser lock — only one extraction at a time
     acquired = _browser_lock.acquire(timeout=90)
     if not acquired:
         return {
             "success": False,
-            "error": "Server busy — another extraction is in progress. Try again in 30 seconds.",
+            "error": "Server busy — another extraction in progress. Retry in ~30s.",
             "channel": channel_slug,
-            "hint": "The server processes one channel at a time to manage memory.",
         }
 
+    browser = None
     try:
         with sync_playwright() as pw:
-            logger.info("Launching Chromium headless...")
-            launch_start = time.time()
+            t0 = time.time()
+            logger.info("  Launching Chromium...")
 
             browser = pw.chromium.launch(
                 headless=True,
@@ -396,19 +361,22 @@ def _extract_stream_url(channel_slug: str, attempt: int = 1) -> dict:
                     "--disable-renderer-backgrounding",
                     "--disable-features=IsolateOrigins,site-per-process,TranslateUI",
                     "--disable-blink-features=AutomationControlled",
-                    "--disable-ipc-flooding-protection",
                     "--no-first-run",
                     "--no-default-browser-check",
                     "--single-process",
-                    "--metrics-recording-only",
                     "--mute-audio",
                     "--autoplay-policy=no-user-gesture-required",
+                    "--disable-hang-monitor",
+                    "--disable-prompt-on-repost",
+                    "--disable-client-side-phishing-detection",
+                    "--disable-component-update",
+                    "--disable-domain-reliability",
                 ],
             )
-            logger.info(f"Browser launched in {time.time() - launch_start:.1f}s")
+            logger.info(f"  Chromium launched in {time.time()-t0:.1f}s")
 
-            ua = _next_user_agent()
-            context = browser.new_context(
+            ua = _get_ua()
+            ctx = browser.new_context(
                 user_agent=ua,
                 viewport={"width": 1366, "height": 768},
                 java_script_enabled=True,
@@ -417,10 +385,7 @@ def _extract_stream_url(channel_slug: str, attempt: int = 1) -> dict:
                 timezone_id="Asia/Karachi",
                 extra_http_headers={
                     "Accept-Language": "en-US,en;q=0.9,ur;q=0.8",
-                    "Accept": (
-                        "text/html,application/xhtml+xml,application/xml;"
-                        "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
-                    ),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                     "Sec-CH-UA": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
                     "Sec-CH-UA-Mobile": "?0",
                     "Sec-CH-UA-Platform": '"Windows"',
@@ -429,178 +394,216 @@ def _extract_stream_url(channel_slug: str, attempt: int = 1) -> dict:
                     "Sec-Fetch-Site": "none",
                     "Sec-Fetch-User": "?1",
                     "Upgrade-Insecure-Requests": "1",
-                    "DNT": "1",
                 },
             )
 
-            # Stealth init script
-            context.add_init_script("""
-                // Hide webdriver
+            # ── Stealth script ──
+            ctx.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-
-                // Fake plugins
                 Object.defineProperty(navigator, 'plugins', {
                     get: () => {
-                        const plugins = [
-                            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
-                            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
-                            { name: 'Native Client', filename: 'internal-nacl-plugin' },
+                        const p = [
+                            {name:'Chrome PDF Plugin', filename:'internal-pdf-viewer'},
+                            {name:'Chrome PDF Viewer', filename:'mhjfbmdgcfjbbpaeojofohoefgiehjai'},
+                            {name:'Native Client', filename:'internal-nacl-plugin'},
                         ];
-                        plugins.length = 3;
-                        return plugins;
-                    },
+                        p.length = 3;
+                        return p;
+                    }
                 });
-
-                // Fake languages
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['en-US', 'en'],
-                });
-
-                // Chrome object
-                window.chrome = {
-                    runtime: {},
-                    loadTimes: function() {},
-                    csi: function() {},
-                    app: {},
-                };
-
-                // Permissions
-                const originalQuery = window.navigator.permissions.query;
-                window.navigator.permissions.query = (parameters) =>
-                    parameters.name === 'notifications'
-                        ? Promise.resolve({ state: Notification.permission })
-                        : originalQuery(parameters);
-
-                // Prevent detection via toString
-                const cleanToString = Function.prototype.toString;
-                Function.prototype.toString = function() {
-                    if (this === Function.prototype.toString) return 'function toString() { [native code] }';
-                    return cleanToString.call(this);
-                };
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+                window.chrome = { runtime: {}, loadTimes: ()=>{}, csi: ()=>{}, app: {} };
+                const oq = window.navigator.permissions.query;
+                window.navigator.permissions.query = (p) =>
+                    p.name === 'notifications'
+                        ? Promise.resolve({state: Notification.permission})
+                        : oq(p);
             """)
 
-            # Block unnecessary resources to save memory and speed up
+            # ── Block heavy resources to save RAM ──
             def route_handler(route):
-                """Block heavy resources we don't need."""
-                resource_type = route.request.resource_type
-                url = route.request.url.lower()
+                rt = route.request.resource_type
+                rurl = route.request.url.lower()
 
-                # Block images, fonts, stylesheets, media (we only need JS + XHR)
-                blocked_types = {"image", "font", "stylesheet", "media"}
-                if resource_type in blocked_types:
-                    # Exception: don't block if it's an HLS segment
-                    if ".m3u8" not in url and ".ts" not in url:
+                # Block images, fonts, stylesheets (except HLS-related)
+                if rt in {"image", "font", "stylesheet"}:
+                    if ".m3u8" not in rurl and ".ts" not in rurl:
                         route.abort()
                         return
 
-                # Block known ad/tracking domains
-                blocked_domains = [
+                # Block ads / trackers
+                blocked = [
                     "google-analytics.com", "googletagmanager.com",
                     "facebook.net", "facebook.com", "fbcdn.net",
                     "doubleclick.net", "googlesyndication.com",
-                    "googleadservices.com", "analytics.",
-                    "tracker.", "pixel.", "ads.",
-                    "hotjar.com", "clarity.ms",
-                    "sentry.io", "bugsnag.com",
+                    "googleadservices.com", "hotjar.com",
+                    "clarity.ms", "sentry.io", "segment.io",
+                    "mixpanel.com", "amplitude.com",
                 ]
-                for domain in blocked_domains:
-                    if domain in url:
+                for d in blocked:
+                    if d in rurl:
                         route.abort()
                         return
 
                 route.continue_()
 
-            context.route("**/*", route_handler)
+            ctx.route("**/*", route_handler)
 
-            page = context.new_page()
-
-            # Attach interceptors BEFORE navigation
+            page = ctx.new_page()
             page.on("response", on_response)
             page.on("requestfailed", on_request_failed)
 
-            # Navigate
-            logger.info(f"Navigating to {page_url}...")
-            nav_start = time.time()
-            try:
-                page.goto(page_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-                logger.info(f"Page DOM loaded in {time.time() - nav_start:.1f}s")
-            except PlaywrightTimeout:
-                logger.warning(
-                    f"Navigation timeout after {time.time() - nav_start:.1f}s "
-                    f"(domcontentloaded), proceeding..."
-                )
+            # ── Try URL candidates until one works ──
+            nav_success = False
+            final_url = None
 
-            # Wait for network to settle
-            try:
-                page.wait_for_load_state("networkidle", timeout=15000)
-                logger.info("Network idle reached")
-            except PlaywrightTimeout:
-                logger.warning("networkidle timeout, proceeding...")
+            for candidate_url in url_candidates:
+                logger.info(f"  Trying: {candidate_url}")
+                try:
+                    resp = page.goto(
+                        candidate_url,
+                        wait_until="domcontentloaded",
+                        timeout=NAV_TIMEOUT,
+                    )
+                    final_url = page.url
+                    page_urls_visited.append(final_url)
 
-            # Check for premium redirect
-            current_url = page.url
-            logger.info(f"Current page URL: {current_url}")
+                    # Check if we got a 404
+                    if resp and resp.status == 404:
+                        logger.info(f"  Got 404 for {candidate_url}, trying next...")
+                        continue
 
-            try:
-                # Only get a portion of content to save memory
-                page_text = page.evaluate("() => document.body ? document.body.innerText.substring(0, 3000) : ''")
-            except Exception:
-                page_text = ""
+                    # Check if page title says 404
+                    try:
+                        title = page.title().lower()
+                        if "404" in title or "not found" in title:
+                            logger.info(f"  Page title indicates 404, trying next...")
+                            continue
+                    except Exception:
+                        pass
 
-            premium_check = _detect_premium(current_url, page_text)
-            if premium_check["is_premium"]:
+                    nav_success = True
+                    logger.info(f"  ✓ Navigation success → {final_url}")
+                    break
+
+                except PlaywrightTimeout:
+                    logger.warning(f"  Timeout for {candidate_url}")
+                    # Still might have loaded enough — check if we captured anything
+                    if captured:
+                        nav_success = True
+                        final_url = page.url
+                        break
+                    continue
+                except Exception as e:
+                    logger.warning(f"  Error for {candidate_url}: {e}")
+                    continue
+
+            if not nav_success and not captured:
                 browser.close()
                 return {
                     "success": False,
-                    "error": "Premium channel — login/subscription required.",
+                    "error": f"Could not load channel page. Tried {len(url_candidates)} URL patterns.",
                     "channel": channel_slug,
-                    "reason": premium_check["reason"],
-                    "detected_url": current_url,
-                    "hint": "This channel requires a Tamasha Pro subscription. Only free channels are supported.",
+                    "urls_tried": url_candidates[:3],
+                    "hint": "Channel slug may be wrong or Tamasha's URL structure changed.",
                 }
 
-            # Check if page returned 404 / channel not found
+            # ── Wait for networkidle ──
             try:
-                title = page.title().lower()
-                if "404" in title or "not found" in title or "page not found" in title:
-                    browser.close()
-                    return {
-                        "success": False,
-                        "error": f"Channel '{channel_slug}' not found on Tamasha (404).",
-                        "channel": channel_slug,
-                        "hint": "This channel slug may be incorrect or the channel was removed.",
-                    }
-            except Exception:
-                pass
-
-            # Wait for video element
-            video_found = False
-            logger.info("Looking for video player...")
-            try:
-                page.wait_for_selector("video", timeout=15000)
-                video_found = True
-                logger.info("✓ Video element found in main page")
+                page.wait_for_load_state("networkidle", timeout=15000)
             except PlaywrightTimeout:
-                logger.info("No <video> in main page, checking iframes...")
+                logger.debug("  networkidle timeout, continuing...")
+
+            # ── Premium detection ──
+            current_url = page.url
+            try:
+                body_text = page.evaluate(
+                    "() => document.body ? document.body.innerText.substring(0, 5000) : ''"
+                )
+            except Exception:
+                body_text = ""
+
+            is_prem, prem_reason = detect_premium(current_url, body_text)
+            if is_prem:
+                browser.close()
+                return {
+                    "success": False,
+                    "error": "Premium channel — requires login/subscription.",
+                    "channel": channel_slug,
+                    "reason": prem_reason,
+                    "final_url": current_url,
+                    "hint": "This channel is not free. Remove it from your requests.",
+                }
+
+            # ── Look for video player ──
+            video_found = False
+            logger.info("  Looking for video player...")
+
+            # Try multiple selectors
+            video_selectors = [
+                "video",
+                "video[src]",
+                ".video-js video",
+                ".jw-video",
+                "#player video",
+                "[class*='player'] video",
+            ]
+            for sel in video_selectors:
                 try:
-                    for frame_element in page.query_selector_all("iframe"):
+                    page.wait_for_selector(sel, timeout=8000)
+                    video_found = True
+                    logger.info(f"  ✓ Found video via: {sel}")
+                    break
+                except PlaywrightTimeout:
+                    continue
+
+            if not video_found:
+                # Check iframes
+                try:
+                    for iframe_el in page.query_selector_all("iframe"):
                         try:
-                            frame = frame_element.content_frame()
+                            frame = iframe_el.content_frame()
                             if frame:
                                 frame.wait_for_selector("video", timeout=5000)
                                 video_found = True
-                                logger.info("✓ Video element found inside iframe")
+                                logger.info("  ✓ Found video inside iframe")
                                 break
                         except Exception:
                             continue
-                except Exception as e:
-                    logger.debug(f"Iframe scan error: {e}")
+                except Exception:
+                    pass
 
             if not video_found:
-                logger.warning("No video element found anywhere on page")
+                logger.warning("  ⚠ No video element found")
 
-            # Click play if needed
+            # ── Dismiss overlays / click play ──
             try:
+                # Cookie consent / overlays
+                dismiss_selectors = [
+                    "button[class*='accept']",
+                    "button[class*='consent']",
+                    "button[class*='close']",
+                    "button[class*='dismiss']",
+                    "[class*='cookie'] button",
+                    "[class*='overlay'] button",
+                    ".modal-close",
+                    "button[aria-label='Close']",
+                ]
+                for sel in dismiss_selectors:
+                    try:
+                        el = page.query_selector(sel)
+                        if el and el.is_visible():
+                            el.click(timeout=2000)
+                            logger.debug(f"  Dismissed overlay: {sel}")
+                            time.sleep(0.5)
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            try:
+                # Play buttons
                 play_selectors = [
                     "button.vjs-big-play-button",
                     ".play-button",
@@ -610,23 +613,23 @@ def _extract_stream_url(channel_slug: str, attempt: int = 1) -> dict:
                     ".jw-icon-playback",
                     ".bmpui-ui-playbacktogglebutton",
                     "[data-testid='play-button']",
+                    ".play-icon",
+                    "video",  # clicking video itself
                 ]
-                for selector in play_selectors:
+                for sel in play_selectors:
                     try:
-                        el = page.query_selector(selector)
-                        if el:
-                            visible = el.is_visible()
-                            if visible:
-                                el.click(timeout=3000)
-                                logger.info(f"Clicked play button: {selector}")
-                                time.sleep(1)
-                                break
+                        el = page.query_selector(sel)
+                        if el and el.is_visible():
+                            el.click(timeout=2000)
+                            logger.info(f"  ▶ Clicked play: {sel}")
+                            time.sleep(1)
+                            break
                     except Exception:
                         continue
-            except Exception as e:
-                logger.debug(f"Play button click: {e}")
+            except Exception:
+                pass
 
-            # Autoplay via JS
+            # ── Force autoplay via JS ──
             try:
                 page.evaluate("""
                     () => {
@@ -634,296 +637,306 @@ def _extract_stream_url(channel_slug: str, attempt: int = 1) -> dict:
                             v.muted = true;
                             v.play().catch(() => {});
                         });
+                        // Also try iframes
+                        document.querySelectorAll('iframe').forEach(f => {
+                            try {
+                                const doc = f.contentDocument || f.contentWindow.document;
+                                if (doc) {
+                                    doc.querySelectorAll('video').forEach(v => {
+                                        v.muted = true;
+                                        v.play().catch(() => {});
+                                    });
+                                }
+                            } catch(e) {}
+                        });
                     }
                 """)
             except Exception:
                 pass
 
-            # Wait for HLS requests
-            logger.info(f"Waiting {EXTRA_WAIT_SECONDS}s for HLS manifest requests...")
-            time.sleep(EXTRA_WAIT_SECONDS)
+            # ── Main HLS wait ──
+            logger.info(f"  Waiting {EXTRA_WAIT}s for HLS manifest requests...")
+            time.sleep(EXTRA_WAIT)
 
-            # If nothing captured yet, try harder
-            if not captured_urls:
-                logger.info("No m3u8 captured yet, attempting additional extraction methods...")
+            # ── If nothing captured, try deeper extraction ──
+            if not captured:
+                logger.info("  No network captures yet — trying JS extraction...")
 
-                # Method 1: Extract from video.src / currentSrc
+                # Method A: video.src / currentSrc
                 try:
-                    js_sources = page.evaluate("""
+                    srcs = page.evaluate("""
                         () => {
-                            const sources = new Set();
+                            const s = new Set();
                             document.querySelectorAll('video').forEach(v => {
-                                if (v.src) sources.add(v.src);
-                                if (v.currentSrc) sources.add(v.currentSrc);
-                                v.querySelectorAll('source').forEach(s => {
-                                    if (s.src) sources.add(s.src);
+                                if (v.src) s.add(v.src);
+                                if (v.currentSrc) s.add(v.currentSrc);
+                                v.querySelectorAll('source').forEach(src => {
+                                    if (src.src) s.add(src.src);
                                 });
                             });
-
-                            // Check iframes
-                            document.querySelectorAll('iframe').forEach(iframe => {
+                            // Iframes
+                            document.querySelectorAll('iframe').forEach(f => {
                                 try {
-                                    const doc = iframe.contentDocument || iframe.contentWindow.document;
-                                    if (doc) {
-                                        doc.querySelectorAll('video').forEach(v => {
-                                            if (v.src) sources.add(v.src);
-                                            if (v.currentSrc) sources.add(v.currentSrc);
-                                        });
-                                    }
+                                    const d = f.contentDocument || f.contentWindow.document;
+                                    if (d) d.querySelectorAll('video').forEach(v => {
+                                        if (v.src) s.add(v.src);
+                                        if (v.currentSrc) s.add(v.currentSrc);
+                                    });
                                 } catch(e) {}
                             });
-
-                            return Array.from(sources);
+                            return [...s];
                         }
                     """)
-                    for src in (js_sources or []):
-                        if src and (".m3u8" in src.lower() or "wmsauthsign" in src.lower()):
+                    for src in (srcs or []):
+                        if src and is_hls_url(src):
                             with captured_lock:
-                                captured_urls.append({
-                                    "url": src,
-                                    "status": 200,
-                                    "content_type": "application/x-mpegURL",
-                                    "timestamp": time.time(),
-                                })
-                            logger.info(f"  Extracted from video.src: {src[:150]}")
+                                captured.append({"url": src, "status": 200, "time": time.time()})
+                            logger.info(f"  ✓ From video.src: {src[:150]}")
                 except Exception as e:
-                    logger.debug(f"  video.src extraction: {e}")
+                    logger.debug(f"  video.src: {e}")
 
-                # Method 2: Check player JS objects
+                # Method B: Player JS instances
                 try:
-                    player_src = page.evaluate("""
+                    ps = page.evaluate("""
                         () => {
+                            const urls = [];
                             // hls.js
                             try {
-                                const videos = document.querySelectorAll('video');
-                                for (const v of videos) {
-                                    // hls.js attaches to video.__hls or video._hls
-                                    for (const key of Object.keys(v)) {
-                                        if (key.toLowerCase().includes('hls')) {
-                                            const hls = v[key];
-                                            if (hls && hls.url) return hls.url;
-                                            if (hls && hls.config && hls.config.url) return hls.config.url;
+                                document.querySelectorAll('video').forEach(v => {
+                                    for (const k of Object.keys(v)) {
+                                        const obj = v[k];
+                                        if (obj && typeof obj === 'object') {
+                                            if (obj.url && typeof obj.url === 'string')
+                                                urls.push(obj.url);
+                                            if (obj.levels && Array.isArray(obj.levels)) {
+                                                obj.levels.forEach(l => {
+                                                    if (l.url && typeof l.url === 'string')
+                                                        urls.push(l.url);
+                                                    if (l.uri) urls.push(l.uri);
+                                                });
+                                            }
                                         }
                                     }
-                                }
+                                });
                             } catch(e) {}
-
-                            // video.js
+                            // videojs
                             try {
                                 if (window.videojs) {
-                                    const players = window.videojs.getAllPlayers
+                                    const pp = window.videojs.getAllPlayers
                                         ? window.videojs.getAllPlayers()
                                         : Object.values(window.videojs.getPlayers());
-                                    for (const p of players) {
-                                        if (p && typeof p.currentSrc === 'function') {
-                                            const s = p.currentSrc();
-                                            if (s) return s;
+                                    pp.forEach(p => {
+                                        if (p) {
+                                            try { urls.push(p.currentSrc()); } catch(e) {}
+                                            try {
+                                                const t = p.tech({IWillNotUseThisInPlugins:true});
+                                                if (t && t.currentSource_)
+                                                    urls.push(t.currentSource_.src);
+                                            } catch(e) {}
                                         }
-                                    }
+                                    });
                                 }
                             } catch(e) {}
-
                             // jwplayer
                             try {
                                 if (window.jwplayer) {
                                     const p = window.jwplayer();
                                     if (p && p.getPlaylistItem) {
                                         const item = p.getPlaylistItem();
-                                        if (item && item.file) return item.file;
-                                        if (item && item.sources) {
-                                            for (const s of item.sources) {
-                                                if (s.file) return s.file;
-                                            }
+                                        if (item) {
+                                            if (item.file) urls.push(item.file);
+                                            if (item.sources)
+                                                item.sources.forEach(s => { if(s.file) urls.push(s.file); });
                                         }
                                     }
                                 }
                             } catch(e) {}
-
-                            // Shaka Player
+                            // Shaka
                             try {
-                                if (window.shaka) {
-                                    const videos = document.querySelectorAll('video');
-                                    for (const v of videos) {
-                                        if (v.shakaPlayerInstance) {
-                                            const uri = v.shakaPlayerInstance.getAssetUri();
-                                            if (uri) return uri;
+                                document.querySelectorAll('video').forEach(v => {
+                                    for (const k of Object.keys(v)) {
+                                        const obj = v[k];
+                                        if (obj && typeof obj.getAssetUri === 'function') {
+                                            urls.push(obj.getAssetUri());
                                         }
                                     }
-                                }
+                                });
                             } catch(e) {}
-
-                            // Look for source in any global config/state
-                            try {
-                                const scripts = document.querySelectorAll('script');
-                                for (const s of scripts) {
-                                    const text = s.textContent || '';
-                                    const match = text.match(/["'](https?:\/\/[^"']*\.m3u8[^"']*)/);
-                                    if (match) return match[1];
-                                }
-                            } catch(e) {}
-
-                            return null;
+                            return urls.filter(u => u && typeof u === 'string');
                         }
                     """)
-                    if player_src and (".m3u8" in player_src.lower() or "wmsauthsign" in player_src.lower()):
-                        with captured_lock:
-                            captured_urls.append({
-                                "url": player_src,
-                                "status": 200,
-                                "content_type": "application/x-mpegURL",
-                                "timestamp": time.time(),
-                            })
-                        logger.info(f"  Extracted from player JS: {player_src[:150]}")
+                    for src in (ps or []):
+                        if is_hls_url(src):
+                            with captured_lock:
+                                captured.append({"url": src, "status": 200, "time": time.time()})
+                            logger.info(f"  ✓ From player JS: {src[:150]}")
                 except Exception as e:
-                    logger.debug(f"  Player JS extraction: {e}")
+                    logger.debug(f"  Player JS: {e}")
 
-                # Method 3: Parse page source for m3u8 URLs via regex
+                # Method C: Regex scan of page source
                 try:
-                    page_source = page.content()
-                    m3u8_pattern = re.compile(
-                        r'(https?://[^\s"\'<>]*\.m3u8[^\s"\'<>]*)',
-                        re.IGNORECASE
+                    html = page.content()
+                    pattern = re.compile(
+                        r'(https?://[^\s"\'<>\\]*\.m3u8[^\s"\'<>\\]*)',
+                        re.IGNORECASE,
                     )
-                    matches = m3u8_pattern.findall(page_source)
-                    for match in matches:
-                        # Unescape common JS escapes
-                        clean = match.replace("\\u0026", "&").replace("\\/", "/").replace("\\u003d", "=")
+                    for m in pattern.findall(html):
+                        clean = (m.replace("\\u0026", "&")
+                                  .replace("\\/", "/")
+                                  .replace("\\u003d", "=")
+                                  .replace("&amp;", "&"))
                         with captured_lock:
-                            captured_urls.append({
-                                "url": clean,
-                                "status": 200,
-                                "content_type": "text/regex-match",
-                                "timestamp": time.time(),
-                            })
-                        logger.info(f"  Regex match in page source: {clean[:150]}")
+                            captured.append({"url": clean, "status": 200, "time": time.time()})
+                        logger.info(f"  ✓ Regex match: {clean[:150]}")
                 except Exception as e:
-                    logger.debug(f"  Regex extraction: {e}")
+                    logger.debug(f"  Regex: {e}")
 
-                # If still nothing, wait a bit more
-                if not captured_urls:
-                    logger.info("Still nothing, waiting 5 more seconds...")
+                # Method D: Check for data attributes
+                try:
+                    data_srcs = page.evaluate("""
+                        () => {
+                            const urls = [];
+                            document.querySelectorAll('[data-src], [data-url], [data-stream], [data-video-url], [data-hls]').forEach(el => {
+                                ['data-src', 'data-url', 'data-stream', 'data-video-url', 'data-hls'].forEach(attr => {
+                                    const v = el.getAttribute(attr);
+                                    if (v) urls.push(v);
+                                });
+                            });
+                            return urls;
+                        }
+                    """)
+                    for src in (data_srcs or []):
+                        if is_hls_url(src):
+                            with captured_lock:
+                                captured.append({"url": src, "status": 200, "time": time.time()})
+                            logger.info(f"  ✓ Data attribute: {src[:150]}")
+                except Exception as e:
+                    logger.debug(f"  Data attrs: {e}")
+
+                # Last resort: wait more
+                if not captured:
+                    logger.info("  Still nothing — final 5s wait...")
                     time.sleep(5)
 
-            # Final diagnostic: check for any network errors related to m3u8
-            if not captured_urls and errors_seen:
-                logger.warning(f"No successful m3u8 but {len(errors_seen)} failed m3u8 requests:")
-                for err in errors_seen[:5]:
-                    logger.warning(f"  Failed: {err}")
-
             browser.close()
-            logger.info(f"Browser closed. Total captured: {len(captured_urls)}")
+            browser = None
+            logger.info(f"  Browser closed. Captured: {len(captured)} URLs")
 
     except PlaywrightTimeout as e:
         logger.error(f"Playwright timeout: {e}")
         return {
             "success": False,
-            "error": f"Timeout during extraction: {str(e)[:200]}",
+            "error": f"Timeout: {str(e)[:200]}",
             "channel": channel_slug,
-            "hint": "Channel page took too long. Try again or check if the channel exists.",
+            "hint": "Page took too long. Try again.",
         }
     except Exception as e:
         logger.error(f"Extraction error: {e}", exc_info=True)
         return {
             "success": False,
-            "error": f"Browser automation error: {str(e)[:300]}",
+            "error": f"Browser error: {str(e)[:300]}",
             "channel": channel_slug,
-            "hint": "Unexpected error. Check server logs.",
         }
     finally:
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
         _browser_lock.release()
 
-    # ------------------------------------------------------------------
-    # Process captured URLs
-    # ------------------------------------------------------------------
-    if not captured_urls:
-        result = {
+    # ==================================================================
+    # Process results
+    # ==================================================================
+    if not captured:
+        # Auto-retry once
+        if attempt < max_attempts:
+            logger.info(f"  Auto-retrying (attempt {attempt+1})...")
+            time.sleep(3)
+            return extract_stream(channel_slug, attempt + 1, max_attempts)
+
+        return {
             "success": False,
             "error": "No m3u8 stream URL captured.",
             "channel": channel_slug,
-            "video_element_found": video_found,
-            "failed_requests": errors_seen[:3] if errors_seen else [],
+            "video_found": video_found,
+            "pages_visited": page_urls_visited[:3],
+            "failed_requests": failed_m3u8[:5],
             "hint": (
-                "Channel may require login or is premium — only use free channels. "
-                "If this is a free channel, try again (some streams take longer to load). "
-                "Use ?force=1 to bypass cache."
+                "Channel may require login/Pro, or the player didn't load. "
+                "Only use confirmed free channels. Try again — some streams "
+                "are intermittent."
             ),
         }
 
-        # Retry once automatically
-        if attempt < MAX_EXTRACTION_RETRIES:
-            logger.info(f"Auto-retrying extraction for '{channel_slug}' (attempt {attempt + 1})...")
-            time.sleep(2)
-            return _extract_stream_url(channel_slug, attempt + 1)
+    # Deduplicate
+    seen = set()
+    unique = []
+    for e in captured:
+        # Simple dedup key
+        key = e["url"].split("?")[0] + "?" + "&".join(
+            sorted(p for p in e["url"].split("?")[1].split("&") if "nimblesessionid" not in p.lower())
+        ) if "?" in e["url"] else e["url"]
 
-        return result
+        if key not in seen:
+            seen.add(key)
+            unique.append(e)
 
-    # Deduplicate by normalized URL
-    seen_normalized = set()
-    unique_urls = []
-    for entry in captured_urls:
-        # Normalize: remove nimblesessionid for dedup, keep everything else
-        parsed = urlparse(entry["url"])
-        params = parse_qs(parsed.query, keep_blank_values=True)
-        params.pop("nimblesessionid", None)
-        norm_query = urlencode(params, doseq=True)
-        norm_url = urlunparse(parsed._replace(query=norm_query))
+    logger.info(f"  Unique URLs: {len(unique)}")
+    for i, e in enumerate(unique):
+        sc = score_url(e["url"])
+        logger.info(f"    [{i}] score={sc:>4d} {e['url'][:180]}")
 
-        if norm_url not in seen_normalized:
-            seen_normalized.add(norm_url)
-            unique_urls.append(entry)
-
-    logger.info(f"Unique m3u8 URLs: {len(unique_urls)}")
-    for i, entry in enumerate(unique_urls):
-        score = _score_m3u8_url(entry["url"])
-        logger.info(f"  [{i}] score={score:>4d}  [{entry['status']}]  {entry['url'][:180]}")
-
-    # Select best URL
-    best = max(unique_urls, key=lambda e: (_score_m3u8_url(e["url"]), e["timestamp"]))
+    # Pick best
+    best = max(unique, key=lambda e: (score_url(e["url"]), e["time"]))
     best_url = best["url"]
-    best_score = _score_m3u8_url(best_url)
+    best_score = score_url(best_url)
 
-    logger.info(f"✓ Selected best URL (score={best_score}): {best_url[:180]}")
+    logger.info(f"  ★ Best (score={best_score}): {best_url[:180]}")
 
-    # Cache it
-    all_urls_list = [e["url"] for e in sorted(unique_urls, key=lambda e: _score_m3u8_url(e["url"]), reverse=True)]
-    _set_cached(channel_slug, best_url, all_urls_list)
+    # Cache
+    all_urls = [e["url"] for e in sorted(unique, key=lambda e: score_url(e["url"]), reverse=True)]
+    cache_set(channel_slug, best_url, all_urls)
 
     return {
         "success": True,
         "stream_url": best_url,
         "channel": channel_slug,
-        "captured_count": len(unique_urls),
-        "selected_score": best_score,
-        "video_element_found": video_found,
+        "captured_count": len(unique),
+        "score": best_score,
+        "video_found": video_found,
+        "alternative_urls": all_urls[1:4] if len(all_urls) > 1 else [],
         "note": (
-            "Fresh HLS link generated. Estimated expiry ~10-30 min. "
-            "Test in VLC, ffplay, or https://hlsjs.video-dev.org/demo/"
+            "Fresh HLS link. Estimated expiry ~10-30 min. "
+            "Play in VLC, ffplay, or https://hlsjs.video-dev.org/demo/"
         ),
     }
 
 
 # ==========================================================================
-# Flask Routes
+# Routes
 # ==========================================================================
 
 @app.route("/", methods=["GET"])
 def index():
+    base = request.host_url.rstrip("/")
     return jsonify({
         "service": "Tamasha Free Channel HLS Stream Extractor",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "status": "running",
         "endpoints": {
-            "GET /": "This documentation",
-            "GET /api/health": "Health check",
-            "GET /api/channels": "List all supported free channels",
-            "GET /api/fresh_stream?channel=<slug>": "Extract fresh HLS stream URL",
-            "GET /api/fresh_stream?channel=<slug>&force=1": "Force-refresh (bypass cache)",
-            "DELETE /api/cache": "Clear all cached URLs",
+            "GET /":                        "API documentation (this page)",
+            "GET /api/health":              "Health check",
+            "GET /api/channels":            "List all supported free channels",
+            "GET /api/fresh_stream?channel=SLUG": "Extract fresh HLS stream URL",
+            "GET /api/fresh_stream?channel=SLUG&force=1": "Force-refresh (skip cache)",
+            "DELETE /api/cache":            "Clear all cached URLs",
+            "DELETE /api/cache?channel=SLUG": "Clear cache for one channel",
         },
-        "example": f"{request.host_url}api/fresh_stream?channel=green-entertainment",
+        "quick_start": f"curl \"{base}/api/fresh_stream?channel=ary-news\"",
         "disclaimer": (
-            "For personal/educational use only. Only free/public channels supported. "
-            "No DRM bypass, no piracy, no premium content access."
+            "Personal/educational use only. Free/public channels only. "
+            "No DRM bypass. No piracy."
         ),
     })
 
@@ -933,149 +946,127 @@ def health():
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat() + "Z",
+        "version": "2.1.0",
         "cache_entries": len(_cache),
-        "total_channels": len(CHANNEL_SLUGS),
+        "channels_available": len(CHANNEL_SLUGS),
     })
 
 
 @app.route("/api/channels", methods=["GET"])
 def list_channels():
-    categories = {
-        "news": [],
-        "entertainment": [],
-        "religious": [],
-        "regional": [],
-        "other": [],
-    }
+    cats = {"news": [], "entertainment": [], "religious": [], "regional": [], "other": []}
     for slug in sorted(CHANNEL_SLUGS.keys()):
         s = slug.lower()
-        if any(kw in s for kw in ["news", "city-42"]):
-            categories["news"].append(slug)
-        elif any(kw in s for kw in [
+        if any(k in s for k in ["news", "city-42"]):
+            cats["news"].append(slug)
+        elif any(k in s for k in [
             "entertainment", "digital", "tv-one", "urdu", "play-tv",
             "see-tv", "hum-tv", "a-plus", "zindagi", "kahani", "musik",
         ]):
-            categories["entertainment"].append(slug)
-        elif any(kw in s for kw in ["madani", "qtv", "paigham"]):
-            categories["religious"].append(slug)
-        elif any(kw in s for kw in ["khyber", "avt", "sindh", "ktn", "waseb", "mehran", "pashto"]):
-            categories["regional"].append(slug)
+            cats["entertainment"].append(slug)
+        elif any(k in s for k in ["madani", "qtv", "paigham"]):
+            cats["religious"].append(slug)
+        elif any(k in s for k in ["khyber", "avt", "sindh", "ktn", "waseb", "mehran", "pashto"]):
+            cats["regional"].append(slug)
         else:
-            categories["other"].append(slug)
+            cats["other"].append(slug)
 
     return jsonify({
-        "total_channels": len(CHANNEL_SLUGS),
-        "channels_by_category": categories,
+        "total": len(CHANNEL_SLUGS),
+        "by_category": cats,
         "all_slugs": sorted(CHANNEL_SLUGS.keys()),
-        "usage": "GET /api/fresh_stream?channel=<any-slug-from-above>",
+        "usage": "GET /api/fresh_stream?channel=<slug>",
     })
 
 
 @app.route("/api/fresh_stream", methods=["GET"])
 def fresh_stream():
-    """Main endpoint — extract fresh signed HLS URL for a free channel."""
     channel = request.args.get("channel", "").strip().lower()
     force = request.args.get("force", "0") == "1"
 
-    # Validate input
     if not channel:
         return jsonify({
             "success": False,
-            "error": "Missing required query parameter: 'channel'",
-            "usage": "/api/fresh_stream?channel=green-entertainment",
-            "available_channels": sorted(CHANNEL_SLUGS.keys()),
+            "error": "Missing 'channel' parameter.",
+            "usage": "/api/fresh_stream?channel=ary-news",
+            "channels": sorted(CHANNEL_SLUGS.keys()),
         }), 400
 
     if channel not in CHANNEL_SLUGS:
         # Fuzzy suggestions
-        suggestions = [
+        parts = [p for p in channel.split("-") if len(p) > 2]
+        suggestions = sorted(set(
             s for s in CHANNEL_SLUGS
             if channel in s or s in channel or
-            any(part in s for part in channel.split("-") if len(part) > 2)
-        ]
+            any(p in s for p in parts)
+        ))[:8]
+
         return jsonify({
             "success": False,
             "error": f"Unknown channel: '{channel}'",
-            "suggestions": sorted(set(suggestions))[:8] if suggestions else None,
-            "hint": "See /api/channels for all available slugs.",
+            "suggestions": suggestions or None,
+            "hint": "GET /api/channels for all available slugs.",
         }), 404
 
     slug = CHANNEL_SLUGS[channel]
 
-    # Check cache
+    # Cache check
     if not force:
-        cached = _get_cached(channel)
+        cached = cache_get(channel)
         if cached:
-            age_s = int((datetime.utcnow() - cached["timestamp"]).total_seconds())
+            age = int((datetime.utcnow() - cached["ts"]).total_seconds())
             return jsonify({
                 "success": True,
                 "stream_url": cached["url"],
                 "channel": channel,
                 "source": "cache",
-                "cache_age_seconds": age_s,
-                "alternative_urls": cached.get("all_urls", [])[:3],
-                "note": f"Cached URL ({age_s}s old, TTL={CACHE_TTL_SECONDS}s). Use &force=1 for fresh extraction.",
+                "cache_age_seconds": age,
+                "alternative_urls": cached.get("all_urls", [])[1:4],
+                "note": f"Cached ({age}s old, TTL {CACHE_TTL}s). Use &force=1 to refresh.",
             })
 
-    # Run extraction
-    logger.info(f"{'='*60}")
-    logger.info(f"EXTRACTION REQUEST: channel='{channel}' slug='{slug}' force={force}")
-    logger.info(f"{'='*60}")
+    # Extract
+    logger.info("=" * 60)
+    logger.info(f"REQUEST: channel='{channel}' slug='{slug}' force={force}")
+    logger.info("=" * 60)
 
-    start = time.time()
-    result = _extract_stream_url(slug)
-    elapsed = round(time.time() - start, 2)
+    t0 = time.time()
+    result = extract_stream(slug)
+    elapsed = round(time.time() - t0, 2)
+
     result["extraction_time_seconds"] = elapsed
-    result["channel"] = channel  # Ensure canonical name
+    result["channel"] = channel
 
-    logger.info(f"EXTRACTION COMPLETE: success={result.get('success')} time={elapsed}s")
+    logger.info(f"RESULT: success={result.get('success')} time={elapsed}s")
 
-    status_code = 200 if result.get("success") else 502
-    return jsonify(result), status_code
+    return jsonify(result), 200 if result.get("success") else 502
 
 
 @app.route("/api/cache", methods=["DELETE"])
-def clear_cache():
-    """Clear cached stream URLs."""
-    channel = request.args.get("channel", "").strip().lower()
-    if channel:
-        _clear_cache(channel)
-        return jsonify({"message": f"Cache cleared for '{channel}'"})
-    else:
-        count = len(_cache)
-        _clear_cache()
-        return jsonify({"message": f"All cache cleared ({count} entries removed)"})
+def clear_cache_endpoint():
+    ch = request.args.get("channel", "").strip().lower()
+    if ch:
+        cache_clear(ch)
+        return jsonify({"message": f"Cache cleared for '{ch}'"})
+    n = len(_cache)
+    cache_clear()
+    return jsonify({"message": f"All cache cleared ({n} entries)"})
 
 
-# Error handlers
 @app.errorhandler(404)
-def not_found(e):
-    return jsonify({
-        "error": "Endpoint not found",
-        "hint": "Visit / for API documentation",
-    }), 404
+def err_404(e):
+    return jsonify({"error": "Not found", "hint": "GET / for docs"}), 404
 
 
 @app.errorhandler(500)
-def server_error(e):
-    logger.error(f"500 error: {e}", exc_info=True)
-    return jsonify({"error": "Internal server error"}), 500
-
-
-@app.errorhandler(429)
-def too_many_requests(e):
-    return jsonify({
-        "error": "Too many requests. Please wait between extractions.",
-    }), 429
+def err_500(e):
+    return jsonify({"error": "Internal error"}), 500
 
 
 # ==========================================================================
-# Entry Point
+# Main
 # ==========================================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    debug = os.environ.get("FLASK_DEBUG", "0") == "1"
-    logger.info(f"Starting Tamasha Stream Extractor v2.0 on port {port}")
-    logger.info(f"Channels configured: {len(CHANNEL_SLUGS)}")
-    logger.info(f"Cache TTL: {CACHE_TTL_SECONDS}s | Extra wait: {EXTRA_WAIT_SECONDS}s")
-    app.run(host="0.0.0.0", port=port, debug=debug)
+    logger.info(f"Starting v2.1 on :{port} | {len(CHANNEL_SLUGS)} channels | TTL {CACHE_TTL}s")
+    app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG") == "1")
