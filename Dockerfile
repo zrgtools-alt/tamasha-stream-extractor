@@ -1,17 +1,14 @@
-# =============================================================================
-# Tamasha Free Channel HLS Extractor — Production Dockerfile
-# =============================================================================
-# Multi-stage isn't needed here; we need Chromium runtime deps in the final image.
-# Based on python:3.11-slim-bookworm for minimal size with glibc.
-# =============================================================================
+# ===========================================================================
+# Tamasha Free Channel HLS Extractor — Production Dockerfile v2
+# Optimized for Render.com (Docker runtime, 512MB-2GB RAM)
+# ===========================================================================
 
-FROM python:3.11-slim-bookworm
+FROM python:3.11-slim-bookworm AS base
 
-# Metadata
 LABEL maintainer="tamasha-extractor"
-LABEL description="Flask + Playwright API for extracting free HLS streams from Tamashaweb.com"
+LABEL version="2.0.0"
 
-# Prevent Python from writing .pyc files and enable unbuffered output
+# Environment
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -19,11 +16,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     DEBIAN_FRONTEND=noninteractive
 
-# -------------------------------------------------------------------------
-# Install system dependencies required by Playwright Chromium
-# -------------------------------------------------------------------------
+# ---- System dependencies for Playwright Chromium ----
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Core libs needed by Chromium
+    # Chromium runtime dependencies
     libnss3 \
     libnspr4 \
     libatk1.0-0 \
@@ -42,58 +37,64 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2 \
     libatspi2.0-0 \
     libwayland-client0 \
-    # Font support (needed for page rendering)
+    libxshmfence1 \
+    libglib2.0-0 \
+    libexpat1 \
+    # Fonts
     fonts-liberation \
     fonts-noto-color-emoji \
-    # Misc utils
+    fonts-freefont-ttf \
+    # Networking / diagnostics
     wget \
+    curl \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    # Clean up
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# -------------------------------------------------------------------------
-# Set up app directory
-# -------------------------------------------------------------------------
 WORKDIR /app
 
-# -------------------------------------------------------------------------
-# Install Python dependencies
-# -------------------------------------------------------------------------
+# ---- Python dependencies ----
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# -------------------------------------------------------------------------
-# Install Playwright Chromium browser
-# -------------------------------------------------------------------------
-RUN playwright install chromium \
-    && playwright install-deps chromium 2>/dev/null || true
+# ---- Playwright Chromium ----
+RUN playwright install chromium && \
+    # Install any remaining OS deps playwright needs
+    playwright install-deps chromium 2>/dev/null || true && \
+    # Verify installation
+    python -c "from playwright.sync_api import sync_playwright; print('Playwright OK')"
 
-# -------------------------------------------------------------------------
-# Copy application code
-# -------------------------------------------------------------------------
+# ---- Application code ----
 COPY app.py .
 
-# -------------------------------------------------------------------------
-# Create non-root user for security
-# -------------------------------------------------------------------------
-RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser \
-    && chown -R appuser:appuser /app \
-    && chown -R appuser:appuser /ms-playwright
+# ---- Non-root user ----
+RUN groupadd -r appuser && \
+    useradd -r -g appuser -d /app -s /sbin/nologin appuser && \
+    chown -R appuser:appuser /app && \
+    chown -R appuser:appuser /ms-playwright && \
+    # Create tmp dir for Chromium
+    mkdir -p /tmp/.chromium && chown -R appuser:appuser /tmp/.chromium
 
 USER appuser
 
-# -------------------------------------------------------------------------
-# Expose port (Render.com uses $PORT env var, default 5000)
-# -------------------------------------------------------------------------
 EXPOSE 5000
 
-# -------------------------------------------------------------------------
-# Health check
-# -------------------------------------------------------------------------
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:${PORT:-5000}/api/health || exit 1
+    CMD wget --quiet --tries=1 --spider http://localhost:${PORT:-5000}/api/health || exit 1
 
-# -------------------------------------------------------------------------
-# Start with gunicorn (production WSGI server)
-# Use --timeout 120 because stream extraction can take 30-60s
-# -------------------------------------------------------------------------
-CMD ["sh", "-c", "gunicorn app:app --bind 0.0.0.0:${PORT:-5000} --workers 2 --threads 4 --timeout 120 --access-logfile - --error-logfile -"]
+# Gunicorn with:
+#   --workers 1     : Single worker (Chromium is heavy, one at a time)
+#   --threads 4     : Handle concurrent HTTP requests via threads
+#   --timeout 120   : Extraction can take 30-60s
+#   --graceful-timeout 30 : Allow clean shutdown
+CMD ["sh", "-c", \
+    "gunicorn app:app \
+     --bind 0.0.0.0:${PORT:-5000} \
+     --workers 1 \
+     --threads 4 \
+     --timeout 120 \
+     --graceful-timeout 30 \
+     --keep-alive 5 \
+     --access-logfile - \
+     --error-logfile - \
+     --log-level info"]
